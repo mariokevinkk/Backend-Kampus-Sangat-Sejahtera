@@ -41,4 +41,23 @@ class Kelas extends Model
     {
         return $this->mahasiswa()->count();  // This returns the number of students in the class
     }
+     public function materi() {
+        return $this->hasMany(Materi::class, 'kelas_id');
+    }
+    public function tugas()
+    {
+        // Relasi One-to-Many: Kelas memiliki banyak Tugas.
+        // Tugas dihubungkan melalui field 'kelas_id' di tabel 'tugas'.
+        return $this->hasMany(Tugas::class, 'kelas_id');
+    }
+    public function pengumuman()
+    {
+        // Relasi One-to-Many: Kelas memiliki banyak Pengumuman.
+        // Diikat melalui field 'kelas_id' di tabel 'sangat_sejahtera_pengumuman'.
+        return $this->hasMany(Pengumuman::class, 'kelas_id');
+    }
+    public function presensiSesi()
+{
+    return $this->hasMany(Presensi::class, 'kelas_id');
+}
 }

@@ -28,4 +28,10 @@ class Mahasiswa extends Model
     {
         return $this->belongsTo(Fakultas::class, 'fakultas_id');
     }
+    public function presensiYangDiikuti()
+{
+    return $this->belongsToMany(Presensi::class, 'presensi_mahasiswa', 'mahasiswa_id', 'presensi_id')
+                ->withPivot('status_kehadiran', 'waktu_presensi')
+                ->withTimestamps();
+}
 }

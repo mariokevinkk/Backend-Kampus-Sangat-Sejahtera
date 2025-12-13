@@ -10,7 +10,7 @@ class Dosen extends Model
 
     // Define the fields that can be mass-assigned
     protected $fillable = [
-        'nip', 'nama', 'alamat', 'no_telephone', 'user_id', 'fakultas_id', 'created_at', 'updated_at'
+        'nip', 'nama', 'alamat', 'no_telepon', 'user_id', 'fakultas_id', 'created_at', 'updated_at'
     ];
 
     // Relationships
@@ -24,4 +24,5 @@ class Dosen extends Model
     {
         return $this->hasMany(Mahasiswa::class, 'dosen_id');
     }
+    
 }

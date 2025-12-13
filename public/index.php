@@ -89,6 +89,7 @@ $app->addRoutingMiddleware();
 // Body Parsing Middleware
 $app->addBodyParsingMiddleware();
 
+
 // Error Middleware
 $errorMiddleware = $app->addErrorMiddleware($displayErrorDetails, $logError, $logErrorDetails);
 $errorMiddleware->setDefaultErrorHandler($errorHandler);
