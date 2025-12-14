@@ -45,188 +45,714 @@ return function (App $app) {
         fn(Request $request, Response $response) =>
         $response->getBody()->write('Hello world!')
     );
+  $app->get('/api/kuis/mahasiswa/{mhs_id}', function (Request $request, Response $response, array $args) {
+    $mhsId = $args['mhs_id'];
+
+    try {
+        // 1. Ambil kelas yang diikuti mahasiswa
+        $kelasDiambil = MahasiswaKelas::where('mahasiswa_id', $mhsId)
+                        ->pluck('kelas_id');
+
+        if ($kelasDiambil->isEmpty()) {
+            $responseData = [
+                'status' => 'success',
+                'message' => 'Mahasiswa ini tidak terdaftar di kelas manapun.',
+                'data' => []
+            ];
+
+            $response->getBody()->write(json_encode($responseData));
+            return $response
+                ->withHeader('Content-Type', 'application/json')
+                ->withStatus(200);
+        }
+
+        // 2. Ambil kuis aktif & closed
+        $kuisList = Kuis::whereIn('kelas_id', $kelasDiambil)
+                        ->withCount('detailSoal')
+                        ->whereIn('status', ['active', 'closed'])
+                        ->orderBy('tanggal_mulai', 'desc')
+                        ->get();
+
+        // 3. Mapping status pengerjaan & nilai
+        $kuisList = $kuisList->map(function ($kuis) use ($mhsId) {
+            $nilaiRecord = NilaiKuis::where('kuis_id', $kuis->id)
+                                    ->where('mahasiswa_id', $mhsId)
+                                    ->first();
+
+            $kuis->status_pengerjaan = $nilaiRecord->status_pengerjaan ?? 'pending';
+            $kuis->nilai = $nilaiRecord->nilai ?? null;
+            $kuis->nilai_kuis_id = $nilaiRecord->id ?? null;
+
+            if (
+                $kuis->status === 'active' &&
+                strtotime($kuis->tanggal_selesai) < time()
+            ) {
+                $kuis->status_pengerjaan = 'expired';
+            }
+
+            return $kuis;
+        });
+
+        $responseData = [
+            'status' => 'success',
+            'data' => $kuisList
+        ];
+
+        $response->getBody()->write(json_encode($responseData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200);
+
+    } catch (\Exception $e) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal memuat kuis: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
+});
+
+// routes.php (Tambahkan di bagian API)
+
+// ====================================================
+// NEW: GET DETAIL KUIS BESERTA SOAL (UNTUK PENGERJAAN)
+// URL: /api/kuis/detail-mhs/{kuis_id}/{mhs_id}
+// ====================================================
+
+// routes.php (Tambahkan di bagian API)
+$app->get('/api/kuis/detail-mhs/{kuis_id}/{mhs_id}', function (Request $request, Response $response, array $args) {
+    $kuisId = $args['kuis_id'];
+    $mhsId  = $args['mhs_id'];
+
+    try {
+        $kuis = Kuis::with('detailSoal')->find($kuisId);
+        $nilaiRecord = NilaiKuis::where('kuis_id', $kuisId)
+                                ->where('mahasiswa_id', $mhsId)
+                                ->first();
+
+        // 1. Validasi kuis & record nilai
+        if (!$kuis || !$nilaiRecord) {
+            $errorData = [
+                'status' => 'error',
+                'message' => 'Kuis atau record nilai tidak ditemukan.'
+            ];
+
+            $response->getBody()->write(json_encode($errorData));
+            return $response
+                ->withHeader('Content-Type', 'application/json')
+                ->withStatus(404);
+        }
+
+        // 2. Validasi status
+        if ($kuis->status !== 'active' ) {
+            $errorData = [
+                'status' => 'error',
+                'message' => 'Kuis tidak aktif, sudah dikerjakan, atau kadaluarsa.'
+            ];
+
+            $response->getBody()->write(json_encode($errorData));
+            return $response
+                ->withHeader('Content-Type', 'application/json')
+                ->withStatus(400);
+        }
+
+        // 3. Update status menjadi STARTED
+        $nilaiRecord->update([
+            'status_pengerjaan' => 'started'
+        ]);
+
+        // 4. Return data kuis
+        $responseData = [
+            'status' => 'success',
+            'data' => $kuis
+        ];
+
+        $response->getBody()->write(json_encode($responseData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200);
+
+    } catch (\Exception $e) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal memuat soal: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
+});
+
+// ====================================================
+// NEW: POST PENGIRIMAN JAWABAN KUIS
+// URL: /api/kuis/submit/{kuis_id}/{mhs_id}
+// ====================================================
+$app->post('/api/kuis/submit/{kuis_id}/{mhs_id}', function (Request $request, Response $response, array $args) {
+    $kuisId = $args['kuis_id'];
+    $mhsId = $args['mhs_id'];
+    $jawabanMahasiswa = (array) $request->getParsedBody();
+
+    try {
+        // 1. Ambil kuis & nilai
+        $kuis = Kuis::with('detailSoal')->find($kuisId);
+        $nilaiRecord = NilaiKuis::where('kuis_id', $kuisId)
+                                ->where('mahasiswa_id', $mhsId)
+                                ->first();
+
+        if (!$kuis || !$nilaiRecord || $nilaiRecord->status_pengerjaan === 'finished') {
+            $errorData = [
+                'status' => 'error',
+                'message' => 'Kuis tidak valid atau sudah dikumpulkan.'
+            ];
+
+            $response->getBody()->write(json_encode($errorData));
+            return $response
+                ->withHeader('Content-Type', 'application/json')
+                ->withStatus(400);
+        }
+
+        $totalNilai = 0;
+        $totalBobotMaksimal = 0;
+
+        // 2. Koreksi jawaban
+        foreach ($kuis->detailSoal as $soal) {
+            $soalId = $soal->id;
+            $jawabanMhs = $jawabanMahasiswa[$soalId] ?? null;
+
+            $totalBobotMaksimal += $soal->nilai_bobot;
+
+            if ($jawabanMhs && $jawabanMhs === $soal->jawaban_benar) {
+                $totalNilai += $soal->nilai_bobot;
+            }
+        }
+
+        // 3. Normalisasi ke skala 100
+        $finalScore = $totalBobotMaksimal > 0
+            ? round(($totalNilai / $totalBobotMaksimal) * 100)
+            : 0;
+
+        // 4. Update nilai
+        $nilaiRecord->update([
+            'nilai' => $finalScore,
+            'status_pengerjaan' => 'finished'
+        ]);
+
+        $responseData = [
+            'status' => 'success',
+            'message' => 'Kuis berhasil dikumpulkan dan dinilai otomatis.',
+            'nilai_akhir' => $finalScore
+        ];
+
+        $response->getBody()->write(json_encode($responseData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200);
+
+    } catch (\Exception $e) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal memproses jawaban: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
+});
+$app->get('/api/penilaian/kuis/{kuisId}/detail', function (Request $request, Response $response, array $args) {
+    $kuisId = $args['kuisId'];
+
+    try {
+        $kuis = Kuis::find($kuisId);
+        if (!$kuis) {
+            $errorData = ['status' => 'error', 'message' => 'Kuis tidak ditemukan'];
+            $response->getBody()->write(json_encode($errorData));
+            return $response
+                ->withHeader('Content-Type', 'application/json')
+                ->withStatus(404); // 🛑 KOREKSI MANUAL RESPONSE
+        }
+
+        // Ambil semua record NilaiKuis untuk Kuis ini
+        $nilaiList = NilaiKuis::where('kuis_id', $kuisId)
+            ->with(['mahasiswa:id,nama,nim']) // Load relasi Mahasiswa
+            ->get();
+
+        $output = [
+            'status' => 'success',
+            'kuis_judul' => $kuis->judul,
+            'data' => $nilaiList->map(function ($nilai) {
+                return [
+                    'mahasiswa_id' => $nilai->mahasiswa_id,
+                    'nim' => $nilai->mahasiswa->nim,
+                    'nama_mahasiswa' => $nilai->mahasiswa->nama,
+                    'nilai_otomatis' => $nilai->nilai, 
+                    'status_pengerjaan' => $nilai->status_pengerjaan,
+                    'tanggal_selesai' => $nilai->updated_at,
+                ];
+            })
+        ];
+
+        $response->getBody()->write(json_encode($output));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200); // 🛑 KOREKSI MANUAL RESPONSE
+
+    } catch (\Exception $e) {
+        $errorData = ['status' => 'error', 'message' => 'Gagal memuat detail nilai: ' . $e->getMessage()];
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500); // 🛑 KOREKSI MANUAL RESPONSE
+    }
+});
+$app->get('/api/admin/grafik-statistik', function (Request $request, Response $response) {
+    try {
+        // 1. Mahasiswa per Fakultas (Hanya ini yang dipertahankan)
+        $mhsPerFakultas = Mahasiswa::selectRaw('fakultas_id, count(*) as total')
+            ->groupBy('fakultas_id')
+            ->with('fakultas:id,nama_fakultas')
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'label' => $item->fakultas->nama_fakultas ?? 'Tidak Ada Fakultas',
+                    'count' => $item->total
+                ];
+            });
+
+        $responseData = [
+            'status' => 'success',
+            'data' => [
+                'mhsPerFakultas' => $mhsPerFakultas,
+            ]
+        ];
+
+        $response->getBody()->write(json_encode($responseData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200);
+
+    } catch (\Exception $e) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal memuat statistik grafik: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
+});
+
+$app->get('/api/nilai/mahasiswa/konsolidasi/{mhs_id}', function (Request $request, Response $response, array $args) {
+    $mhsId = $args['mhs_id'];
+
+    try {
+        // 1. Nilai Kuis
+        $nilaiKuis = NilaiKuis::where('mahasiswa_id', $mhsId)
+            ->where('status_pengerjaan', 'finished')
+            ->with(['kuis' => function ($query) {
+                $query->select('id', 'judul', 'kelas_id', 'tanggal_selesai');
+            }])
+            ->get(['id', 'kuis_id', 'nilai', 'status_pengerjaan']);
+
+        $kuisData = $nilaiKuis->map(function ($nilai) {
+            return [
+                'id' => $nilai->kuis_id,
+                'judul' => $nilai->kuis->judul,
+                'kelas_id' => $nilai->kuis->kelas_id,
+                'tanggal_selesai' => $nilai->kuis->tanggal_selesai,
+                'nilai' => $nilai->nilai,
+                'status' => $nilai->status_pengerjaan,
+                'jenis' => 'Kuis'
+            ];
+        });
+
+        // 2. Nilai Tugas
+        $tugasData = TugasMahasiswa::where('mahasiswa_id', $mhsId)
+            ->whereNotNull('nilai')
+            ->where('status', 'submitted')
+            ->with(['tugas' => function ($query) {
+                $query->select('id', 'judul_tugas', 'kelas_id', 'tanggal_pengumpulan');
+            }])
+            ->get();
+
+        $tugasOutput = $tugasData->map(function ($tugasMhs) {
+            if ($tugasMhs->tugas) {
+                return [
+                    'id' => $tugasMhs->tugas_id,
+                    'judul' => $tugasMhs->tugas->judul_tugas,
+                    'kelas_id' => $tugasMhs->tugas->kelas_id,
+                    'tanggal_selesai' => $tugasMhs->tanggal_kumpul,
+                    'nilai' => $tugasMhs->nilai,
+                    'status' => 'Dinilai',
+                    'jenis' => 'Tugas'
+                ];
+            }
+            return null;
+        })->filter();
+
+        $responseData = [
+            'status' => 'success',
+            'data' => [
+                'kuis' => $kuisData->values(),
+                'tugas' => $tugasOutput->values()
+            ]
+        ];
+
+        $response->getBody()->write(json_encode($responseData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200);
+
+    } catch (\Exception $e) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal memuat nilai konsolidasi: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
+});
+
+
+// $app->post('/api/kuis/submit/{kuis_id}/{mhs_id}', function (Request $request, Response $response, array $args) {
+//     $kuisId = $args['kuis_id'];
+//     $mhsId = $args['mhs_id'];
+//     $jawabanMahasiswa = (array)$request->getParsedBody(); // Format: ['soal_id' => 'jawaban_pilihan (A/B/C/D)', ...]
+
+//     try {
+//         // 1. Dapatkan detail kuis dan kunci jawaban
+//         $kuis = Kuis::with('detailSoal')->find($kuisId);
+//         $nilaiRecord = NilaiKuis::where('kuis_id', $kuisId)->where('mahasiswa_id', $mhsId)->first();
+
+//         if (!$kuis || !$nilaiRecord || $nilaiRecord->status_pengerjaan === 'finished') {
+//             $errorData = ['status' => 'error', 'message' => 'Kuis tidak valid atau sudah dikumpulkan.'];
+//             return $response->withHeader('Content-Type', 'application/json')->withStatus(400)->getBody()->write(json_encode($errorData));
+//         }
+
+//         $totalNilai = 0;
+//         $totalBobotMaksimal = 0;
+
+//         // 2. Koreksi dan hitung nilai
+//         foreach ($kuis->detailSoal as $soal) {
+//             $soalId = $soal->id;
+//             $jawabanMhs = $jawabanMahasiswa[$soalId] ?? null;
+//             $kunci = $soal->jawaban_benar;
+//             $bobot = $soal->nilai_bobot;
+
+//             $totalBobotMaksimal += $bobot;
+
+//             if ($jawabanMhs && $jawabanMhs === $kunci) {
+//                 $totalNilai += $bobot;
+//             }
+//         }
+        
+//         // 3. Konversi ke Skala 100 (jika total bobot maksimal bukan 100)
+//         // Jika total bobot maksimal bukan 100, kita normalisasi. Jika 0, hindari pembagian.
+//         $finalScore = ($totalBobotMaksimal > 0) 
+//             ? round(($totalNilai / $totalBobotMaksimal) * 100)
+//             : 0;
+            
+
+//         // 4. Update NilaiKuis
+//         $nilaiRecord->update([
+//             'nilai' => $finalScore,
+//             'status_pengerjaan' => 'finished'
+//         ]);
+
+//         $responseData = [
+//             'status' => 'success', 
+//             'message' => 'Kuis berhasil dikumpulkan dan dinilai otomatis.', 
+//             'nilai_akhir' => $finalScore
+//         ];
+//         return $response->withHeader('Content-Type', 'application/json')->withStatus(200)->getBody()->write(json_encode($responseData));
+
+//     } catch (\Exception $e) {
+//         $errorData = ['status' => 'error', 'message' => 'Gagal memproses jawaban: ' . $e->getMessage()];
+//         return $response->withHeader('Content-Type', 'application/json')->withStatus(500)->getBody()->write(json_encode($errorData));
+//     }
+// })->add(new JwtMiddleware());
 $app->group('/api/kuis', function (Group $group) {
     // 1. GET: Ambil daftar kuis per kelas
     // routes.php (Tambahkan di dalam $app->group('/api/kuis', function (Group $group) { ... });)
 
     // 3. GET: Detail Kuis dan Soalnya (untuk modal edit)
-    $group->get('/detail/{id}', function (Request $request, Response $response, array $args) {
-        $kuis = Kuis::with('detailSoal')->find($args['id']);
+   $group->get('/detail/{id}', function (Request $request, Response $response, array $args) {
+    $kuis = Kuis::with('detailSoal')->find($args['id']);
 
-        if (!$kuis) {
-            $errorData = ['status' => 'error', 'message' => 'Kuis tidak ditemukan.'];
-            return $response->withHeader('Content-Type', 'application/json')->withStatus(404)->getBody()->write(json_encode($errorData));
-        }
+    if (!$kuis) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Kuis tidak ditemukan.'
+        ];
 
-        $responseData = ['status' => 'success', 'data' => $kuis];
-        return $response->withHeader('Content-Type', 'application/json')->withStatus(200)->getBody()->write(json_encode($responseData));
-    });
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(404);
+    }
+
+    $responseData = [
+        'status' => 'success',
+        'data' => $kuis
+    ];
+
+    $response->getBody()->write(json_encode($responseData));
+    return $response
+        ->withHeader('Content-Type', 'application/json')
+        ->withStatus(200);
+});
 
     // 4. PUT: Update Kuis dan Soalnya
-    $group->put('/update/{id}', function (Request $request, Response $response, array $args) {
-        $kuisId = $args['id'];
-        $data = (array)$request->getParsedBody();
-        $soalData = $data['soal'] ?? [];
+   $group->put('/update/{id}', function (Request $request, Response $response, array $args) {
+    $kuisId = $args['id'];
+    $data = (array) $request->getParsedBody();
+    $soalData = $data['soal'] ?? [];
 
-        try {
-            Kuis::getConnection()->beginTransaction();
+    try {
+        DB::beginTransaction();
 
-            $kuis = Kuis::find($kuisId);
-            if (!$kuis) {
-                 throw new \Exception("Kuis tidak ditemukan.");
-            }
-
-            // A. Update Kuis Utama
-            $kuis->update([
-                'judul' => $data['judul'],
-                'deskripsi' => $data['deskripsi'] ?? null,
-                'tanggal_mulai' => $data['tanggal_mulai'],
-                'tanggal_selesai' => $data['tanggal_selesai'],
-                'durasi_menit' => $data['durasi_menit'] ?? 60,
-                'status' => $data['status'] ?? $kuis->status, // Dosen bisa mengubah status
-            ]);
-
-            // B. Hapus soal lama dan masukkan yang baru
-            KuisDetailSoal::where('kuis_id', $kuisId)->delete();
-            foreach ($soalData as $soal) {
-                KuisDetailSoal::create([
-                    'kuis_id' => $kuisId,
-                    'soal' => $soal['soal'],
-                    'pilihan_a' => $soal['pilihan_a'],
-                    'pilihan_b' => $soal['pilihan_b'],
-                    'pilihan_c' => $soal['pilihan_c'] ?? null,
-                    'pilihan_d' => $soal['pilihan_d'] ?? null,
-                    'jawaban_benar' => $soal['jawaban_benar'],
-                    'nilai_bobot' => $soal['nilai_bobot'] ?? 10,
-                ]);
-            }
-            // Catatan: Logika Auto-trigger Nilai tidak perlu diulangi di update, kecuali status diubah dari 'draft' ke 'active'
-            
-            Kuis::getConnection()->commit();
-            $successData = ['status' => 'success', 'message' => 'Kuis berhasil diperbarui.'];
-            return $response->withHeader('Content-Type', 'application/json')->withStatus(200)->getBody()->write(json_encode($successData));
-
-        } catch (\Exception $e) {
-            Kuis::getConnection()->rollBack();
-            $errorData = ['status' => 'error', 'message' => 'Gagal memperbarui kuis: ' . $e->getMessage()];
-            return $response->withHeader('Content-Type', 'application/json')->withStatus(500)->getBody()->write(json_encode($errorData));
+        $kuis = Kuis::find($kuisId);
+        if (!$kuis) {
+            throw new \Exception('Kuis tidak ditemukan.');
         }
-    });
+
+        // A. UPDATE KUIS UTAMA
+        $kuis->update([
+            'judul' => $data['judul'],
+            'deskripsi' => $data['deskripsi'] ?? null,
+            'tanggal_mulai' => $data['tanggal_mulai'],
+            'tanggal_selesai' => $data['tanggal_selesai'],
+            'durasi_menit' => $data['durasi_menit'] ?? 60,
+            'status' => $data['status'] ?? $kuis->status,
+        ]);
+
+        // B. RESET & INSERT ULANG SOAL
+        KuisDetailSoal::where('kuis_id', $kuisId)->delete();
+
+        foreach ($soalData as $soal) {
+            KuisDetailSoal::create([
+                'kuis_id' => $kuisId,
+                'soal' => $soal['soal'],
+                'pilihan_a' => $soal['pilihan_a'],
+                'pilihan_b' => $soal['pilihan_b'],
+                'pilihan_c' => $soal['pilihan_c'] ?? null,
+                'pilihan_d' => $soal['pilihan_d'] ?? null,
+                'jawaban_benar' => $soal['jawaban_benar'],
+                'nilai_bobot' => $soal['nilai_bobot'] ?? 10,
+            ]);
+        }
+
+        DB::commit();
+
+        $successData = [
+            'status' => 'success',
+            'message' => 'Kuis berhasil diperbarui.'
+        ];
+
+        $response->getBody()->write(json_encode($successData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200);
+
+    } catch (\Exception $e) {
+        DB::rollBack();
+
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal memperbarui kuis: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
+});
+
 
     // 5. DELETE: Hapus Kuis
-    $group->delete('/delete/{id}', function (Request $request, Response $response, array $args) {
-        $kuis = Kuis::find($args['id']);
-        if (!$kuis) {
-            $errorData = ['status' => 'error', 'message' => 'Kuis tidak ditemukan.'];
-            return $response->withHeader('Content-Type', 'application/json')->withStatus(404)->getBody()->write(json_encode($errorData));
-        }
+   $group->delete('/delete/{id}', function (Request $request, Response $response, array $args) {
+    $kuis = Kuis::find($args['id']);
 
-        try {
-            Kuis::getConnection()->beginTransaction();
-            // Penghapusan akan otomatis menghapus soal dan nilai_kuis berkat ON DELETE CASCADE
-            $kuis->delete(); 
-            Kuis::getConnection()->commit();
+    if (!$kuis) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Kuis tidak ditemukan.'
+        ];
 
-            $successData = ['status' => 'success', 'message' => 'Kuis berhasil dihapus.'];
-            return $response->withHeader('Content-Type', 'application/json')->withStatus(200)->getBody()->write(json_encode($successData));
-        } catch (\Exception $e) {
-            Kuis::getConnection()->rollBack();
-            $errorData = ['status' => 'error', 'message' => 'Gagal menghapus kuis: ' . $e->getMessage()];
-            return $response->withHeader('Content-Type', 'application/json')->withStatus(500)->getBody()->write(json_encode($errorData));
-        }
-    });
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(404);
+    }
+
+    try {
+        DB::beginTransaction();
+
+        // ON DELETE CASCADE akan menghapus soal & nilai otomatis
+        $kuis->delete();
+
+        DB::commit();
+
+        $successData = [
+            'status' => 'success',
+            'message' => 'Kuis berhasil dihapus.'
+        ];
+
+        $response->getBody()->write(json_encode($successData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200);
+
+    } catch (\Exception $e) {
+        DB::rollBack();
+
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal menghapus kuis: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
+});
+
     $group->get('/by-kelas/{kelas_id}', function (Request $request, Response $response, array $args) {
-        $kuisList = Kuis::where('kelas_id', $args['kelas_id'])
-                        ->withCount('detailSoal') // Menghitung jumlah soal
+    $kelasId = $args['kelas_id'];
+
+    try {
+        $kuisList = Kuis::where('kelas_id', $kelasId)
+                        ->withCount('detailSoal')
                         ->orderBy('tanggal_mulai', 'desc')
                         ->get();
-        
-        $responseData = ['status' => 'success', 'data' => $kuisList];
+
+        $responseData = [
+            'status' => 'success',
+            'data' => $kuisList
+        ];
+
+        $response->getBody()->write(json_encode($responseData));
 
         return $response
             ->withHeader('Content-Type', 'application/json')
-            ->withStatus(200)
-            ->getBody()
-            ->write(json_encode($responseData)); // 💡 FIXED: Menggunakan $responseData
-    });
+            ->withStatus(200);
+
+    } catch (\Exception $e) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal memuat kuis: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
+});
+
 
     // 2. POST: Simpan Kuis (Beserta Auto-Trigger Nilai)
-   $group->post('/store', function (Request $request, Response $response) {
-        $data = (array)$request->getParsedBody();
-        $soalData = $data['soal'] ?? [];
-        $kelasId = $data['kelas_id'];
+  $group->post('/store', function (Request $request, Response $response) {
+    $data = (array) $request->getParsedBody();
+    $soalData = $data['soal'] ?? [];
+    $kelasId = $data['kelas_id'] ?? null;
 
-        if (empty($data['judul']) || empty($soalData)) {
-            $errorData = ['status' => 'error', 'message' => 'Judul dan minimal satu soal wajib diisi.'];
-            return $response->withHeader('Content-Type', 'application/json')->withStatus(400)->getBody()->write(json_encode($errorData));
-        }
+    // VALIDASI AWAL
+    if (empty($data['judul']) || empty($soalData)) {
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Judul dan minimal satu soal wajib diisi.'
+        ];
 
-        try {
-            // 💡 KOREKSI TRANSAKSI: Gunakan Facade DB
-            DB::beginTransaction(); // Menggantikan Kuis::getConnection()->beginTransaction();
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(400);
+    }
 
-            // A. Buat Kuis Utama
-            $kuis = Kuis::create([
-                'kelas_id' => $kelasId,
-                'judul' => $data['judul'],
-                'deskripsi' => $data['deskripsi'] ?? null,
-                'tanggal_mulai' => $data['tanggal_mulai'],
-                'tanggal_selesai' => $data['tanggal_selesai'],
-                'durasi_menit' => $data['durasi_menit'] ?? 60,
-                'status' => 'draft',
+    try {
+        DB::beginTransaction();
+
+        // A. SIMPAN KUIS
+        $kuis = Kuis::create([
+            'kelas_id' => $kelasId,
+            'judul' => $data['judul'],
+            'deskripsi' => $data['deskripsi'] ?? null,
+            'tanggal_mulai' => $data['tanggal_mulai'],
+            'tanggal_selesai' => $data['tanggal_selesai'],
+            'durasi_menit' => $data['durasi_menit'] ?? 60,
+            'status' => 'draft',
+        ]);
+
+        // B. SIMPAN SOAL
+        foreach ($soalData as $soal) {
+            KuisDetailSoal::create([
+                'kuis_id' => $kuis->id,
+                'soal' => $soal['soal'],
+                'pilihan_a' => $soal['pilihan_a'],
+                'pilihan_b' => $soal['pilihan_b'],
+                'pilihan_c' => $soal['pilihan_c'] ?? null,
+                'pilihan_d' => $soal['pilihan_d'] ?? null,
+                'jawaban_benar' => $soal['jawaban_benar'],
+                'nilai_bobot' => $soal['nilai_bobot'] ?? 10,
             ]);
-
-            // B. Masukkan Detail Soal
-            foreach ($soalData as $soal) {
-                KuisDetailSoal::create([
-                    'kuis_id' => $kuis->id,
-                    'soal' => $soal['soal'],
-                    'pilihan_a' => $soal['pilihan_a'],
-                    'pilihan_b' => $soal['pilihan_b'],
-                    'pilihan_c' => $soal['pilihan_c'] ?? null,
-                    'pilihan_d' => $soal['pilihan_d'] ?? null,
-                    'jawaban_benar' => $soal['jawaban_benar'],
-                    'nilai_bobot' => $soal['nilai_bobot'] ?? 10,
-                ]);
-            }
-            
-            // C. AUTO-TRIGGER: Buat Entri NilaiKuis
-            $mahasiswaKelas = MahasiswaKelas::where('kelas_id', $kelasId)->get();
-            
-            foreach ($mahasiswaKelas as $mk) {
-                NilaiKuis::create([
-                    'kuis_id' => $kuis->id,
-                    'mahasiswa_id' => $mk->mahasiswa_id,
-                    'nilai' => 0, 
-                    'status_pengerjaan' => 'pending'
-                ]);
-            }
-
-            // 💡 KOREKSI TRANSAKSI: Gunakan Facade DB
-            DB::commit(); // Menggantikan Kuis::getConnection()->commit();
-            
-            $successData = ['status' => 'success', 'message' => 'Kuis dan entri nilai berhasil dibuat.'];
-            return $response
-                ->withHeader('Content-Type', 'application/json')
-                ->withStatus(201)
-                ->getBody()
-                ->write(json_encode($successData));
-
-        } catch (\Exception $e) {
-            // 💡 KOREKSI TRANSAKSI: Gunakan Facade DB
-            DB::rollBack(); // Menggantikan Kuis::getConnection()->rollBack();
-            
-            $errorData = ['status' => 'error', 'message' => 'Gagal menyimpan kuis: ' . $e->getMessage()];
-            return $response
-                ->withHeader('Content-Type', 'application/json')
-                ->withStatus(500)
-                ->getBody()
-                ->write(json_encode($errorData));
         }
-    });
-    // ... Tambahkan GET /detail/{id} dan PUT /update/{id}
-    // ... Tambahkan DELETE /delete/{id}
+
+        // C. AUTO INSERT NILAI
+        $mahasiswaKelas = MahasiswaKelas::where('kelas_id', $kelasId)->get();
+        foreach ($mahasiswaKelas as $mk) {
+            NilaiKuis::create([
+                'kuis_id' => $kuis->id,
+                'mahasiswa_id' => $mk->mahasiswa_id,
+                'nilai' => 0,
+                'status_pengerjaan' => 'pending'
+            ]);
+        }
+
+        DB::commit();
+
+        $successData = [
+            'status' => 'success',
+            'message' => 'Kuis dan entri nilai berhasil dibuat.'
+        ];
+
+        $response->getBody()->write(json_encode($successData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(201);
+
+    } catch (\Exception $e) {
+        DB::rollBack();
+
+        $errorData = [
+            'status' => 'error',
+            'message' => 'Gagal menyimpan kuis: ' . $e->getMessage()
+        ];
+
+        $response->getBody()->write(json_encode($errorData));
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(500);
+    }
 });
+});
+
+    // === ROUTE DOSEN ===
 
 $app->put('/api/tugas/nilai/{submission_id}', function (Request $request, Response $response, array $args) {
     $submissionId = $args['submission_id'];
